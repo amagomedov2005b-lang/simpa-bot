@@ -1,0 +1,24 @@
+# База с анкетами — НЕ коммитить (живёт только на сервере)
+dating.db
+dating.db-wal
+dating.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Бэкапы
+backups/
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Логи
+*.log
+
+# Системное
+.DS_Store
