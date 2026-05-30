@@ -48,6 +48,10 @@ BOOST_PRICE, BOOST_SECONDS = 10, 30 * 60
 LIKES_PRICE, LIKES_SECONDS = 50, 7 * 86400
 UNBAN_PRICE = 50                          # самостоятельный разбан
 
+# --- Рефералы ---
+REF_NEEDED = 3                            # приглашённых за 1 день топа
+REF_REWARD_DAYS = 1                       # дней ⭐ Премиума за каждые REF_NEEDED
+
 # --- Цензура фото (18+) ---
 EXPLICIT_NUDE_CLASSES = {
     "FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED",
@@ -77,6 +81,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 db: aiosqlite.Connection = None  # type: ignore
+BOT_USERNAME = ""  # заполнится при старте
 
 # ---- Цензура фото: ленивая загрузка ----
 NUDE_DETECTOR = None
@@ -107,6 +112,7 @@ SWIPE_DAY: dict[int, list] = defaultdict(lambda: [0, 0.0])
 NEARBY_NOTIFIED: set[int] = set()
 PENDING_MSG: dict[int, int] = {}          # uid -> target uid (ждём текст сообщения для лайка)
 APPEAL_WAIT: set[int] = set()             # uid пишет текст апелляции
+PENDING_REF: dict[int, int] = {}          # новый uid -> кто пригласил (до создания анкеты)
 
 LINE = "━━━━━━━━━━━━━"
 
@@ -135,6 +141,9 @@ async def init_db():
         f_age_min INTEGER DEFAULT 14,
         f_age_max INTEGER DEFAULT 99,
         f_dist INTEGER DEFAULT 0,
+        referrer INTEGER DEFAULT 0,
+        ref_count INTEGER DEFAULT 0,
+        ref_progress INTEGER DEFAULT 0,
         created INTEGER
     );
     CREATE TABLE IF NOT EXISTS likes(
@@ -171,6 +180,9 @@ async def migrate():
     migrations = {
         "strikes": "INTEGER DEFAULT 0",
         "top_tier": "INTEGER DEFAULT 0",
+        "referrer": "INTEGER DEFAULT 0",
+        "ref_count": "INTEGER DEFAULT 0",
+        "ref_progress": "INTEGER DEFAULT 0",
     }
     changed = False
     for col, decl in migrations.items():
@@ -322,6 +334,7 @@ def main_menu():
             [KeyboardButton(text="🔍 Смотреть анкеты")],
             [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="💞 Мои метчи")],
             [KeyboardButton(text="❤️ Кто меня лайкнул"), KeyboardButton(text="🚀 Поднять анкету")],
+            [KeyboardButton(text="🎁 Пригласить друзей")],
             [KeyboardButton(text="⚙️ Фильтры"), KeyboardButton(text="✏️ Изменить")],
             [KeyboardButton(text="⏸ Скрыть/Показать"), KeyboardButton(text="🗑 Удалить")],
         ],
@@ -632,6 +645,12 @@ async def start(m: Message, state: FSMContext):
     if u:
         await m.answer("👋 <b>С возвращением!</b>\nЧем займёмся?", reply_markup=main_menu())
     else:
+        # реферальная ссылка: /start ref12345
+        parts = (m.text or "").split(maxsplit=1)
+        if len(parts) == 2 and parts[1].startswith("ref"):
+            ref_id = parts[1][3:]
+            if ref_id.isdigit() and int(ref_id) != m.from_user.id:
+                PENDING_REF[m.from_user.id] = int(ref_id)
         await state.set_state(Reg.name)
         await m.answer(
             "✨ <b>Добро пожаловать в Симпа!</b> ✨\n"
@@ -736,24 +755,66 @@ async def finalize(m: Message, state: FSMContext):
     uid = m.from_user.id
     existed = await get_user(uid)
     created = existed["created"] if existed else now()
+    is_new = existed is None
     keep = dict(strikes=0, top_tier=0, top_until=0, boost_until=0, likes_until=0,
-                f_age_min=14, f_age_max=99, f_dist=0)
+                f_age_min=14, f_age_max=99, f_dist=0,
+                referrer=0, ref_count=0, ref_progress=0)
     if existed:
         for k in keep:
             keep[k] = existed[k]
+    # реферер (только для новой анкеты и если пришёл по ссылке)
+    if is_new and uid in PENDING_REF:
+        keep["referrer"] = PENDING_REF.pop(uid)
     await db.execute("""INSERT OR REPLACE INTO users
         (uid,name,age,gender,looking,about,photos,lat,lon,status,reject_reason,
-         strikes,top_tier,top_until,boost_until,likes_until,f_age_min,f_age_max,f_dist,created)
-        VALUES(?,?,?,?,?,?,?,?,?, 'pending','', ?,?,?,?,?,?,?,?,?)""",
+         strikes,top_tier,top_until,boost_until,likes_until,f_age_min,f_age_max,f_dist,
+         referrer,ref_count,ref_progress,created)
+        VALUES(?,?,?,?,?,?,?,?,?, 'pending','', ?,?,?,?,?,?,?,?,?,?,?,?)""",
         (uid, d["name"], d["age"], d["gender"], d["looking"], d["about"],
          json.dumps(d["photos"]), d.get("lat"), d.get("lon"),
          keep["strikes"], keep["top_tier"], keep["top_until"], keep["boost_until"], keep["likes_until"],
-         keep["f_age_min"], keep["f_age_max"], keep["f_dist"], created))
+         keep["f_age_min"], keep["f_age_max"], keep["f_dist"],
+         keep["referrer"], keep["ref_count"], keep["ref_progress"], created))
     await db.commit()
     await state.clear()
     invalidate(uid)
     await m.answer("🎉 <b>Анкета готова!</b>\nПроверяю её…", reply_markup=main_menu())
     await run_moderation(uid)
+    # начислить приглашение рефереру (один раз, для новой анкеты)
+    if is_new and keep["referrer"]:
+        await credit_referral(keep["referrer"])
+
+
+async def credit_referral(ref_uid: int):
+    """+1 приглашённый рефереру; за каждые REF_NEEDED — день ⭐ Премиума."""
+    ref = await get_user(ref_uid)
+    if not ref:
+        return
+    count = (ref["ref_count"] or 0) + 1
+    progress = (ref["ref_progress"] or 0) + 1
+    reward_msg = ""
+    if progress >= REF_NEEDED:
+        progress = 0
+        # выдать день Премиума (продлевает, если уже есть; не понижает Супер/VIP)
+        base = max(now(), ref["top_until"] or 0)
+        until = base + REF_REWARD_DAYS * 86400
+        new_tier = ref["top_tier"] if (top_active(ref) and ref["top_tier"] >= 1) else 1
+        await db.execute("UPDATE users SET ref_count=?, ref_progress=?, top_tier=?, top_until=? WHERE uid=?",
+                         (count, progress, new_tier, until, ref_uid))
+        reward_msg = (f"\n🎁 Ты пригласил {REF_NEEDED} друзей — "
+                      f"тебе начислен {REF_REWARD_DAYS} день ⭐ Премиума до {fmt_dt(until)}!")
+    else:
+        left = REF_NEEDED - progress
+        await db.execute("UPDATE users SET ref_count=?, ref_progress=? WHERE uid=?",
+                         (count, progress, ref_uid))
+        reward_msg = f"\nЕщё {left} — и получишь день ⭐ Премиума 🔥"
+    await db.commit()
+    invalidate(ref_uid)
+    try:
+        await bot.send_message(ref_uid, f"🎉 По твоей ссылке зарегистрировался новый друг!\n"
+                                        f"Всего приглашено: <b>{count}</b>.{reward_msg}")
+    except Exception:
+        pass
 
 
 # ==================== BROWSING ====================
@@ -941,7 +1002,8 @@ async def appeal_text(m: Message):
 
 @dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_({
     "🔍 Смотреть анкеты", "👤 Моя анкета", "💞 Мои метчи", "❤️ Кто меня лайкнул",
-    "🚀 Поднять анкету", "⚙️ Фильтры", "✏️ Изменить", "⏸ Скрыть/Показать", "🗑 Удалить"
+    "🚀 Поднять анкету", "🎁 Пригласить друзей", "⚙️ Фильтры", "✏️ Изменить",
+    "⏸ Скрыть/Показать", "🗑 Удалить"
 }))
 async def catch_like_message(m: Message, state: FSMContext):
     """Ловит текст сообщения для лайка (только если мы его ждём и не в другом сценарии)."""
@@ -1230,6 +1292,31 @@ async def send_invoice(chat_id: int, title: str, desc: str, payload: str, amount
         provider_token="", currency="XTR",
         prices=[LabeledPrice(label=title, amount=amount)],
     )
+
+@dp.message(F.text == "🎁 Пригласить друзей")
+async def invite(m: Message):
+    u = await get_user(m.from_user.id)
+    if not u:
+        return await m.answer("Сначала создай анкету: /start")
+    link = f"https://t.me/{BOT_USERNAME}?start=ref{m.from_user.id}"
+    count = u["ref_count"] or 0
+    progress = u["ref_progress"] or 0
+    left = REF_NEEDED - progress
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📤 Поделиться ссылкой",
+                             url=f"https://t.me/share/url?url={link}&text="
+                                 f"Залетай в Симпа — знакомства рядом 💞")
+    ]])
+    await m.answer(
+        "🎁 <b>Приглашай друзей — получай Премиум!</b>\n"
+        f"{LINE}\n"
+        f"За каждых <b>{REF_NEEDED}</b> друзей, создавших анкету, "
+        f"тебе {REF_REWARD_DAYS} день ⭐ Премиума бесплатно.\n\n"
+        f"👥 Приглашено: <b>{count}</b>\n"
+        f"⏳ До награды осталось: <b>{left}</b>\n\n"
+        f"Твоя ссылка:\n<code>{link}</code>\n\n"
+        "Отправь её друзьям 👇",
+        reply_markup=kb)
 
 @dp.message(F.text == "🚀 Поднять анкету")
 async def promo(m: Message):
@@ -1733,9 +1820,15 @@ async def admin_refund(m: Message):
 
 # ==================== RUN ====================
 async def main():
-    global NUDE_DETECTOR
+    global NUDE_DETECTOR, BOT_USERNAME
     await init_db()
     await load_admins()
+    try:
+        _me = await bot.get_me()
+        BOT_USERNAME = _me.username or ""
+        logging.info(f"Bot username: @{BOT_USERNAME}")
+    except Exception:
+        pass
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="Меню / создать анкету"),
