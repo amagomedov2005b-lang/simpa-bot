@@ -113,6 +113,7 @@ NEARBY_NOTIFIED: set[int] = set()
 PENDING_MSG: dict[int, int] = {}          # uid -> target uid (ждём текст сообщения для лайка)
 APPEAL_WAIT: set[int] = set()             # uid пишет текст апелляции
 PENDING_REF: dict[int, int] = {}          # новый uid -> кто пригласил (до создания анкеты)
+BROADCAST_PENDING: dict[int, str] = {}    # админ uid -> текст рассылки (ждёт подтверждения)
 
 LINE = "━━━━━━━━━━━━━"
 
@@ -1654,6 +1655,7 @@ async def admin_stats(m: Message):
         f"/delvip &lt;id&gt; — снять 👑 VIP\n"
         f"/user &lt;id&gt; — инфо о пользователе\n"
         f"/broadcast &lt;текст&gt; — рассылка всем\n"
+        f"/send &lt;id&gt; &lt;текст&gt; — личное сообщение одному\n"
         f"/ban &lt;id&gt; · /unban &lt;id&gt; · /refund &lt;charge_id&gt;\n"
         f"/addadmin &lt;id&gt; · /deladmin &lt;id&gt; · /admins")
 
@@ -1749,11 +1751,38 @@ async def admin_broadcast(m: Message):
         return
     text = (m.text or "")[len("/broadcast"):].strip()
     if not text:
-        return await m.answer("Использование: /broadcast &lt;текст рассылки&gt;")
+        return await m.answer("Использование: /broadcast &lt;текст рассылки&gt;\n\n"
+                              "💡 Для одного человека: /send &lt;id&gt; &lt;текст&gt;")
+    cur = await db.execute("SELECT COUNT(*) c FROM users WHERE status NOT IN ('banned')")
+    n = (await cur.fetchone())["c"]
+    # сохраняем текст и просим подтверждение (защита от случайной рассылки)
+    BROADCAST_PENDING[m.from_user.id] = text
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Разослать {n} людям", callback_data="bc_yes"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="bc_no"),
+    ]])
+    await m.answer(f"📣 <b>Подтверди рассылку</b>\n{LINE}\n{text}\n{LINE}\n"
+                   f"Получателей: <b>{n}</b>. Отправить?", reply_markup=kb)
+
+@dp.callback_query(F.data == "bc_no")
+async def broadcast_cancel(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Нет прав", show_alert=True)
+    BROADCAST_PENDING.pop(c.from_user.id, None)
+    await c.message.edit_text("❌ Рассылка отменена.")
+    await c.answer()
+
+@dp.callback_query(F.data == "bc_yes")
+async def broadcast_confirm(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Нет прав", show_alert=True)
+    text = BROADCAST_PENDING.pop(c.from_user.id, None)
+    if not text:
+        return await c.answer("Текст рассылки не найден, начни заново через /broadcast", show_alert=True)
+    await c.message.edit_text("📣 Рассылка запущена…")
     cur = await db.execute("SELECT uid FROM users WHERE status NOT IN ('banned')")
     rows = await cur.fetchall()
     ok = fail = 0
-    await m.answer(f"📣 Рассылка запущена на {len(rows)} получателей…")
     for r in rows:
         try:
             await bot.send_message(r["uid"], f"📣 <b>Объявление</b>\n{LINE}\n{text}")
@@ -1761,7 +1790,28 @@ async def admin_broadcast(m: Message):
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await m.answer(f"✅ Готово. Доставлено: {ok}, не дошло: {fail}.")
+    await c.message.answer(f"✅ Готово. Доставлено: {ok}, не дошло: {fail}.")
+    await c.answer()
+
+@dp.message(Command("send"))
+async def admin_send(m: Message):
+    """Личное сообщение одному пользователю по ID."""
+    if not is_admin(m.from_user.id):
+        return
+    parts = (m.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return await m.answer("Использование: /send &lt;id&gt; &lt;текст&gt;\n"
+                              "Пример: /send 123456789 Привет! Это сообщение от администрации.")
+    uid = int(parts[1])
+    text = parts[2]
+    target = await get_user(uid)
+    if not target:
+        return await m.answer(f"Пользователь <code>{uid}</code> не найден.")
+    try:
+        await bot.send_message(uid, f"✉️ <b>Сообщение от администрации</b>\n{LINE}\n{text}")
+        await m.answer(f"✅ Отправлено пользователю <b>{esc(target['name'])}</b> (<code>{uid}</code>).")
+    except Exception as e:
+        await m.answer(f"❌ Не удалось отправить: {e}\n(Возможно, пользователь заблокировал бота.)")
 
 @dp.message(Command("ban"))
 async def admin_ban(m: Message):
