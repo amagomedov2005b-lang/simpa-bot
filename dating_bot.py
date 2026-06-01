@@ -1130,7 +1130,8 @@ async def _show_who_liked(uid: int, chat_id: int):
         JOIN users u ON u.uid=l.who
         WHERE l.whom=? AND u.status='active'
           AND NOT EXISTS (SELECT 1 FROM likes l2 WHERE l2.who=? AND l2.whom=l.who)
-        ORDER BY l.ts DESC LIMIT 30""", (uid, uid))
+          AND l.who NOT IN (SELECT whom FROM seen WHERE who=?)
+        ORDER BY l.ts DESC LIMIT 30""", (uid, uid, uid))
     rows = await cur.fetchall()
     n = len(rows)
     if n == 0:
@@ -1140,12 +1141,16 @@ async def _show_who_liked(uid: int, chat_id: int):
         ph = photos_of(r)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❤️ В ответ", callback_data=f"like_{r['uid']}"),
-            InlineKeyboardButton(text="👎", callback_data="wl_skip"),
+            InlineKeyboardButton(text="👎", callback_data=f"wlskip_{r['uid']}"),
         ]])
         await bot.send_photo(chat_id, ph[0], caption=profile_caption(r, u), reply_markup=kb)
 
-@dp.callback_query(F.data == "wl_skip")
+@dp.callback_query(F.data.startswith("wlskip_"))
 async def wl_skip(c: CallbackQuery):
+    target = int(c.data.split("_")[1])
+    # запоминаем, что отклонили — больше не покажется в списке лайкнувших
+    await db.execute("INSERT OR IGNORE INTO seen(who,whom) VALUES(?,?)", (c.from_user.id, target))
+    await db.commit()
     try:
         await c.message.delete()
     except Exception:
