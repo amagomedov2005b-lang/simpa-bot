@@ -1140,10 +1140,27 @@ async def _show_who_liked(uid: int, chat_id: int):
     for r in rows:
         ph = photos_of(r)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❤️ В ответ", callback_data=f"like_{r['uid']}"),
+            InlineKeyboardButton(text="❤️ В ответ", callback_data=f"wllike_{r['uid']}"),
             InlineKeyboardButton(text="👎", callback_data=f"wlskip_{r['uid']}"),
         ]])
         await bot.send_photo(chat_id, ph[0], caption=profile_caption(r, u), reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("wllike_"))
+async def wl_like(c: CallbackQuery):
+    """Лайк в ответ из списка 'кто меня лайкнул' — карточка исчезает, лента не открывается."""
+    target = int(c.data.split("_")[1])
+    match = await do_like(c.from_user.id, target)
+    try:
+        await c.message.delete()
+    except Exception:
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    if match:
+        await c.answer("🎉 Это метч!", show_alert=True)
+    else:
+        await c.answer("❤️")
 
 @dp.callback_query(F.data.startswith("wlskip_"))
 async def wl_skip(c: CallbackQuery):
@@ -1151,6 +1168,18 @@ async def wl_skip(c: CallbackQuery):
     # запоминаем, что отклонили — больше не покажется в списке лайкнувших
     await db.execute("INSERT OR IGNORE INTO seen(who,whom) VALUES(?,?)", (c.from_user.id, target))
     await db.commit()
+    try:
+        await c.message.delete()
+    except Exception:
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await c.answer("Пропущено")
+
+@dp.callback_query(F.data == "wl_skip")
+async def wl_skip_old(c: CallbackQuery):
+    """Старый формат кнопки (для карточек, отправленных до обновления)."""
     try:
         await c.message.delete()
     except Exception:
