@@ -34,6 +34,7 @@ DB = "dating.db"
 
 MAX_PHOTOS = 3
 REPORTS_TO_HIDE = 3                       # жалоб от РАЗНЫХ людей -> анкета скрывается на проверку
+DAILY_REPORTS = 6                         # сколько жалоб можно подать в сутки (скользящие 24ч)
 SWIPE_MIN_INTERVAL = 0.4                  # сек между свайпами (антифлуд)
 SWIPE_DAILY_LIMIT = 500                   # макс свайпов в сутки
 BATCH = 400                               # пул кандидатов для сортировки по расстоянию
@@ -114,6 +115,10 @@ PENDING_MSG: dict[int, int] = {}          # uid -> target uid (ждём текс
 APPEAL_WAIT: set[int] = set()             # uid пишет текст апелляции
 PENDING_REF: dict[int, int] = {}          # новый uid -> кто пригласил (до создания анкеты)
 BROADCAST_PENDING: dict[int, str] = {}    # админ uid -> текст рассылки (ждёт подтверждения)
+# история для кнопки "Назад": uid -> {"items": [список row-анкет, до 3], "ts": время последнего действия}
+SWIPE_HISTORY: dict[int, dict] = {}
+HISTORY_MAX = 3                           # сколько предыдущих анкет помнить
+HISTORY_TTL = 1800                        # 30 минут жизни истории в RAM
 
 LINE = "━━━━━━━━━━━━━"
 
@@ -145,6 +150,8 @@ async def init_db():
         referrer INTEGER DEFAULT 0,
         ref_count INTEGER DEFAULT 0,
         ref_progress INTEGER DEFAULT 0,
+        report_count INTEGER DEFAULT 0,
+        report_window INTEGER DEFAULT 0,
         created INTEGER
     );
     CREATE TABLE IF NOT EXISTS likes(
@@ -184,6 +191,8 @@ async def migrate():
         "referrer": "INTEGER DEFAULT 0",
         "ref_count": "INTEGER DEFAULT 0",
         "ref_progress": "INTEGER DEFAULT 0",
+        "report_count": "INTEGER DEFAULT 0",
+        "report_window": "INTEGER DEFAULT 0",
     }
     changed = False
     for col, decl in migrations.items():
@@ -366,7 +375,7 @@ def loc_kb():
         resize_keyboard=True, one_time_keyboard=True,
     )
 
-def swipe_kb(target, photos_count):
+def swipe_kb(target, photos_count, has_back=False):
     rows = []
     if photos_count > 1:
         rows.append([
@@ -378,11 +387,14 @@ def swipe_kb(target, photos_count):
         InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like_{target}"),
         InlineKeyboardButton(text="💌 Лайк + сообщение", callback_data=f"likemsg_{target}"),
     ])
-    rows.append([
+    bottom = [
         InlineKeyboardButton(text="👎", callback_data=f"dislike_{target}"),
         InlineKeyboardButton(text="🚩 Жалоба", callback_data=f"report_{target}"),
         InlineKeyboardButton(text="💤 Хватит", callback_data="stop"),
-    ])
+    ]
+    rows.append(bottom)
+    if has_back:
+        rows.append([InlineKeyboardButton(text="⬅️ Предыдущая анкета", callback_data="goback")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def promo_kb():
@@ -866,7 +878,33 @@ async def next_candidate(uid: int):
         return QUEUE[uid].popleft()
     return None
 
-async def show_next(chat_id: int, uid: int):
+def _history_get(uid: int):
+    """Вернуть валидную историю (с учётом TTL) или None."""
+    h = SWIPE_HISTORY.get(uid)
+    if not h:
+        return None
+    if time.time() - h.get("ts", 0) > HISTORY_TTL:
+        SWIPE_HISTORY.pop(uid, None)
+        return None
+    return h
+
+def _history_push(uid: int, row):
+    """Добавить анкету в историю (максимум HISTORY_MAX, старые выпадают)."""
+    h = _history_get(uid) or {"items": [], "ts": time.time()}
+    # не дублируем подряд один и тот же uid
+    h["items"] = [r for r in h["items"] if r["uid"] != row["uid"]]
+    h["items"].append(row)
+    if len(h["items"]) > HISTORY_MAX:
+        h["items"] = h["items"][-HISTORY_MAX:]
+    h["ts"] = time.time()
+    SWIPE_HISTORY[uid] = h
+
+async def show_next(chat_id: int, uid: int, save_history: bool = True):
+    # сохраняем текущую анкету в историю перед показом следующей
+    if save_history:
+        cur_state = CURRENT.get(uid)
+        if cur_state and cur_state.get("row"):
+            _history_push(uid, cur_state["row"])
     cand = await next_candidate(uid)
     if not cand:
         CURRENT.pop(uid, None)
@@ -877,9 +915,10 @@ async def show_next(chat_id: int, uid: int):
     await db.execute("INSERT OR IGNORE INTO seen(who,whom) VALUES(?,?)", (uid, cand["uid"]))
     await db.commit()
     ph = photos_of(cand)
+    has_back = bool(_history_get(uid) and _history_get(uid)["items"])
     msg = await bot.send_photo(chat_id, ph[0],
                                caption=profile_caption(cand, viewer),
-                               reply_markup=swipe_kb(cand["uid"], len(ph)))
+                               reply_markup=swipe_kb(cand["uid"], len(ph), has_back=has_back))
     CURRENT[uid] = {"row": cand, "idx": 0, "msg": msg.message_id, "chat": chat_id}
 
 @dp.message(F.text == "🔍 Смотреть анкеты")
@@ -901,7 +940,8 @@ async def flip_photo(c: CallbackQuery):
         return await c.answer()
     st["idx"] = (st["idx"] + (1 if c.data == "pnext" else -1)) % len(ph)
     viewer = await get_user(c.from_user.id)
-    kb = swipe_kb(st["row"]["uid"], len(ph))
+    has_back = bool(_history_get(c.from_user.id) and _history_get(c.from_user.id)["items"])
+    kb = swipe_kb(st["row"]["uid"], len(ph), has_back=has_back)
     kb.inline_keyboard[0][1].text = f"{st['idx']+1}/{len(ph)}"
     try:
         await bot.edit_message_media(
@@ -1046,8 +1086,37 @@ async def stop_browse(c: CallbackQuery):
     CURRENT.pop(c.from_user.id, None)
     NEARBY_NOTIFIED.discard(c.from_user.id)
     PENDING_MSG.pop(c.from_user.id, None)
+    SWIPE_HISTORY.pop(c.from_user.id, None)
     await c.answer()
     await c.message.answer("Окей, до встречи 🙂", reply_markup=main_menu())
+
+@dp.callback_query(F.data == "goback")
+async def go_back(c: CallbackQuery):
+    """Вернуться к предыдущей анкете (до 3 назад, живёт 30 мин)."""
+    uid = c.from_user.id
+    h = _history_get(uid)
+    if not h or not h["items"]:
+        return await c.answer("Предыдущих анкет нет 🙂", show_alert=True)
+    prev = h["items"].pop()           # последняя из истории
+    h["ts"] = time.time()
+    if not h["items"]:
+        SWIPE_HISTORY.pop(uid, None)  # история опустела
+    # проверим, что анкета ещё активна
+    fresh = await get_user(prev["uid"])
+    if not fresh or fresh["status"] != "active":
+        await c.answer("Эта анкета уже недоступна", show_alert=True)
+        # покажем следующую по истории, если есть
+        if _history_get(uid) and _history_get(uid)["items"]:
+            return await go_back(c)
+        return
+    viewer = await get_user(uid)
+    ph = photos_of(fresh)
+    has_back = bool(_history_get(uid) and _history_get(uid)["items"])
+    await c.answer("⬅️ Предыдущая")
+    msg = await bot.send_photo(c.message.chat.id, ph[0],
+                               caption=profile_caption(fresh, viewer),
+                               reply_markup=swipe_kb(fresh["uid"], len(ph), has_back=has_back))
+    CURRENT[uid] = {"row": fresh, "idx": 0, "msg": msg.message_id, "chat": c.message.chat.id}
 
 
 async def user_link(uid: int) -> str:
@@ -1292,8 +1361,40 @@ async def report(c: CallbackQuery):
     target = int(c.data.split("_")[1])
     if me == target:
         return await c.answer("Нельзя пожаловаться на себя 🙂", show_alert=True)
+
+    # --- дневной лимит жалоб (скользящие 24 часа) ---
+    reporter = await get_user(me)
+    if reporter:
+        win = reporter["report_window"] or 0
+        cnt_today = reporter["report_count"] or 0
+        # окно истекло (прошло 24ч) -> сброс
+        if now() - win >= 86400:
+            cnt_today = 0
+            win = now()
+            await db.execute("UPDATE users SET report_count=0, report_window=? WHERE uid=?", (win, me))
+            await db.commit()
+        if cnt_today >= DAILY_REPORTS:
+            left = 86400 - (now() - win)
+            h = left // 3600
+            m_ = (left % 3600) // 60
+            return await c.answer(
+                f"❌ У вас закончились жалобы на сегодня ({DAILY_REPORTS}/{DAILY_REPORTS}).\n"
+                f"Попробуйте через {h:02d}:{m_:02d}.",
+                show_alert=True)
+
+    # проверка: уже жаловался на этого?
+    already = await (await db.execute("SELECT 1 FROM reports WHERE who=? AND whom=?", (me, target))).fetchone()
+
     await db.execute("INSERT OR IGNORE INTO reports(who,whom,ts) VALUES(?,?,?)", (me, target, now()))
+    # засчитываем в дневной лимит ТОЛЬКО новую жалобу (не повторную на того же)
+    if not already and reporter:
+        new_win = reporter["report_window"] or now()
+        if now() - new_win >= 86400:
+            new_win = now()
+        await db.execute("UPDATE users SET report_count=report_count+1, report_window=? WHERE uid=?",
+                         (new_win, me))
     await db.commit()
+
     # уникальные жалобщики
     cnt = (await (await db.execute("SELECT COUNT(DISTINCT who) c FROM reports WHERE whom=?", (target,))).fetchone())["c"]
     if cnt >= REPORTS_TO_HIDE:
@@ -1302,7 +1403,6 @@ async def report(c: CallbackQuery):
             await db.execute("UPDATE users SET status='hidden' WHERE uid=?", (target,))
             await db.commit()
             invalidate(target)
-            # пользователю — мягкое уведомление
             try:
                 await bot.send_message(
                     target,
@@ -1311,12 +1411,14 @@ async def report(c: CallbackQuery):
                     "Дождитесь решения — обычно это занимает немного времени.")
             except Exception:
                 pass
-            # всем админам — карточка с фото и кнопками
             ph = photos_of(tu)
             cap = (f"🚩 <b>Жалобы на анкету</b> (×{cnt})\nID: <code>{target}</code>\n{LINE}\n"
                    + profile_caption(tu))
             await broadcast_admins(cap, photo=(ph[0] if ph else None), kb=review_kb(target))
-    await c.answer("🚩 Жалоба отправлена. Спасибо!", show_alert=True)
+    # сколько жалоб осталось сегодня
+    r2 = await get_user(me)
+    left_today = max(0, DAILY_REPORTS - (r2["report_count"] or 0)) if r2 else 0
+    await c.answer(f"🚩 Жалоба отправлена. Спасибо!\nОсталось жалоб сегодня: {left_today}", show_alert=True)
     await show_next(c.message.chat.id, me)
 
 
