@@ -933,8 +933,9 @@ async def browse(m: Message):
 @dp.callback_query(F.data.in_({"pprev", "pnext"}))
 async def flip_photo(c: CallbackQuery):
     st = CURRENT.get(c.from_user.id)
-    if not st:
-        return await c.answer()
+    # листаем фото только если нажали на АКТУАЛЬНОЙ карточке (не на старой из истории чата)
+    if not st or st.get("msg") != c.message.message_id:
+        return await c.answer("Это старая анкета 🙂 Листай текущую внизу.", show_alert=True)
     ph = photos_of(st["row"])
     if len(ph) <= 1:
         return await c.answer()
